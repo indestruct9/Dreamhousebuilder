@@ -1,28 +1,43 @@
+# main.py
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from ai.generator import generate_layout  # <-- AI generator function
+from typing import Optional, List, Dict, Any
+from ai.generator import generate_layout
 
-# Initialize FastAPI
-app = FastAPI()
+app = FastAPI(title="Custom Dream House AI Builder - Backend")
 
-# Request schema for /design
+# ---- CORS (lets React call us) ----
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # DEV only; tighten later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---- Request/Response models ----
 class DesignRequest(BaseModel):
-    description: str | None = None
-    mood: str | None = None
-    bedrooms: int | None = None
+    description: Optional[str] = ""
+    mood: Optional[str] = "cozy"
+    bedrooms: Optional[int] = 2
 
-# Root endpoint (to test server)
+class RoomModel(BaseModel):
+    name: str
+    size: float
+    x: float
+    y: float
+
+class LayoutModel(BaseModel):
+    rooms: List[RoomModel]
+    meta: Dict[str, Any]
+
+# ---- Endpoints ----
 @app.get("/")
-def read_root():
-    return {"message": "Backend is running successfully!"}
+def root():
+    return {"message": "Backend is running ✅"}
 
-# AI-powered endpoint
-@app.post("/design")
+@app.post("/design", response_model=LayoutModel)
 def design(req: DesignRequest):
-    # Call our AI layout generator
-    layout = generate_layout(
-        req.description or "",
-        req.mood or "cozy",
-        req.bedrooms or 2
-    )
+    layout = generate_layout(req.description or "", req.mood or "cozy", req.bedrooms or 2)
     return layout
