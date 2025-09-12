@@ -1,13 +1,10 @@
 import React from "react";
-import { Box } from "@react-three/drei";
 
-const Room = ({ name, size, x, y }) => {
+export default function Room({ name, size }) {
   return (
-    <mesh position={[x, 0, y]}>
-      <boxGeometry args={[size, 1, size]} />
-      <meshStandardMaterial color="skyblue" />
-    </mesh>
+    <div className="p-3 border rounded-lg bg-white shadow">
+      <h3 className="font-bold">{name}</h3>
+      <p>Size: {size} sq ft</p>
+    </div>
   );
-};
-
-export default Room;
+}

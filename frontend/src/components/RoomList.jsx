@@ -1,14 +1,18 @@
-export default function RoomList({ rooms }) {
+import React from "react";
+import Room from "./Room";
+
+const mockRooms = [
+  { name: "Living Room", size: 250 },
+  { name: "Bedroom", size: 180 },
+  { name: "Kitchen", size: 120 },
+];
+
+export default function RoomList() {
   return (
-    <div className="mt-4">
-      <h2 className="text-xl font-bold mb-2">Rooms</h2>
-      <ul className="space-y-1">
-        {rooms.map((r, i) => (
-          <li key={i} className="p-2 bg-gray-200 rounded">
-            {r.type} — {r.size} sqft
-          </li>
-        ))}
-      </ul>
+    <div className="grid gap-4">
+      {mockRooms.map((r, i) => (
+        <Room key={i} name={r.name} size={r.size} />
+      ))}
     </div>
   );
 }
