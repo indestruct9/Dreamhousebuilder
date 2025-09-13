@@ -7,12 +7,15 @@ import RoomEditor from "../components/RoomEditor";
 import api from "../services/api";
 
 /**
- * Editor with:
- * - history stack (undo / redo)
- * - export floorplan SVG
- * - integrates with ThreeDViewer via onTransformEnd (or onMoveRoom)
+ * Day 13 Editor — includes Versions compare UI
  *
- * Note: this file intentionally keeps the same external API used earlier.
+ * Full replacement for src/pages/Editor.jsx.
+ * Works with backend Day12 endpoints:
+ *  - GET /projects/{id}/versions
+ *  - GET /projects/{id}/versions/{vid}
+ *  - POST /projects/{id}/versions/{vid}/revert   (revert remains)
+ *
+ * Keep other components (PreferenceForm, ThreeDViewer, RoomList, RoomEditor) as-is.
  */
 
 export default function Editor() {
@@ -27,14 +30,26 @@ export default function Editor() {
   const [snapEnabled, setSnapEnabled] = useState(false);
   const snapSize = 0.25;
 
-  const viewerRef = useRef(null);
+  // Versions UI
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [versionsList, setVersionsList] = useState([]);
+  const [loadingVersions, setLoadingVersions] = useState(false);
+  const [previewingVersion, setPreviewingVersion] = useState(null);
 
-  // history stacks in refs (so they don't trigger re-renders)
+  // Compare UI states
+  const [compareMode, setCompareMode] = useState(false);
+  const [compareLeftId, setCompareLeftId] = useState(null);
+  const [compareRightId, setCompareRightId] = useState(null);
+  const [compareLeftLayout, setCompareLeftLayout] = useState(null);
+  const [compareRightLayout, setCompareRightLayout] = useState(null);
+  const [compareDiff, setCompareDiff] = useState(null);
+  const [loadingCompare, setLoadingCompare] = useState(false);
+
+  const viewerRef = useRef(null);
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
   const initialLoadRef = useRef(true);
 
-  // Load stored layout (from Dashboard open or localStorage)
   useEffect(() => {
     const stored = localStorage.getItem("loadedLayout");
     const storedId = localStorage.getItem("loadedProjectId");
@@ -48,24 +63,17 @@ export default function Editor() {
       setProjectId(storedId);
       localStorage.removeItem("loadedProjectId");
     }
-    // mark initial load finished on next tick
     setTimeout(() => (initialLoadRef.current = false), 10);
   }, []);
 
-  // Utility: deep clone layout
+  // ---------- History helpers ----------
   const cloneLayout = (l) => (l ? JSON.parse(JSON.stringify(l)) : { rooms: [], meta: {} });
-
-  // Push to history (internal)
   const pushHistory = (prev) => {
     if (!prev) return;
     undoStackRef.current.push(cloneLayout(prev));
-    // limit history size
     if (undoStackRef.current.length > 100) undoStackRef.current.shift();
-    // clearing redo stack on new change
     redoStackRef.current = [];
   };
-
-  // Wrapper to set layout and push history (unless skipHistory true)
   const setLayoutWithHistory = (updater, { skipHistory = false } = {}) => {
     setLayout((prev) => {
       if (!skipHistory && !initialLoadRef.current) {
@@ -76,35 +84,29 @@ export default function Editor() {
     });
   };
 
-  // Undo
   const undo = () => {
     const undoStack = undoStackRef.current;
     if (!undoStack.length) {
       return alert("Nothing to undo");
     }
     setLayout((current) => {
-      // push current to redo
       redoStackRef.current.push(cloneLayout(current));
       const prev = undoStack.pop();
       return prev;
     });
   };
-
-  // Redo
   const redo = () => {
     const redoStack = redoStackRef.current;
     if (!redoStack.length) {
       return alert("Nothing to redo");
     }
     setLayout((current) => {
-      // push current to undo
       undoStackRef.current.push(cloneLayout(current));
       const next = redoStack.pop();
       return next;
     });
   };
 
-  // Keyboard shortcuts: Ctrl/Cmd+Z and Ctrl/Cmd+Y
   useEffect(() => {
     const onKey = (e) => {
       const z = e.key.toLowerCase() === "z";
@@ -119,13 +121,10 @@ export default function Editor() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- Handlers using setLayoutWithHistory so they are undoable ----
-
+  // ---------- Core handlers ----------
   const handleGenerated = (newLayout) => {
-    // generation is a big change; treat it as a new root — skip pushing prior state
     setLayoutWithHistory(() => newLayout, { skipHistory: true });
     setSelected(null);
     setProjectId(null);
@@ -137,7 +136,6 @@ export default function Editor() {
     setSelected(name);
   };
 
-  // On transform end from ThreeDViewer (move/rotate/scale complete)
   const handleTransformEnd = (roomName, { x, y, rotationY, scale }) => {
     setLayoutWithHistory((prev) => {
       if (!prev) return prev;
@@ -180,17 +178,23 @@ export default function Editor() {
     });
   };
 
-  // Save project: capture screenshot, then POST to backend with thumbnail
+  // ---------- Save / Export ----------
   const handleSaveProject = async () => {
     if (!layout) return alert("No layout to save.");
+    const token = localStorage.getItem("token");
+    if (!token) {
+      const ok = confirm("You must be logged in to save a project. Go to Login page?");
+      if (ok) window.location.href = "/login";
+      return;
+    }
+
     const name = prompt("Project name:", (layout?.meta?.description || "My Project"));
     if (!name) return;
 
-    // Capture screenshot (PNG base64)
     let thumbnail = null;
     try {
       if (viewerRef.current && typeof viewerRef.current.capture === "function") {
-        thumbnail = viewerRef.current.capture(); // data:image/png;base64,...
+        thumbnail = viewerRef.current.capture();
       }
     } catch (e) {
       console.warn("Capture failed:", e);
@@ -198,6 +202,7 @@ export default function Editor() {
 
     try {
       if (projectId) {
+        // update — backend will create a version snapshot before update
         await api.put(`/projects/${projectId}`, { name, layout, thumbnail });
         alert("Project updated.");
       } else {
@@ -205,17 +210,15 @@ export default function Editor() {
         setProjectId(res.data.id);
         alert("Saved. id: " + res.data.id);
       }
-      // preview thumbnail if present
       if (thumbnail) setThumbnailUrl(thumbnail);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       console.error(err);
-      alert("Save failed. Check backend console.");
+      alert(err?.response?.data?.detail || "Save failed. Check backend console.");
     }
   };
 
-  // Export layout JSON locally
   const handleExportJSON = () => {
     if (!layout) return alert("No layout to export");
     const blob = new Blob([JSON.stringify(layout, null, 2)], { type: "application/json" });
@@ -227,12 +230,10 @@ export default function Editor() {
     URL.revokeObjectURL(url);
   };
 
-  // ---------------- Floorplan SVG export ----------------
+  // Export SVG (floorplan) — same helper as before
   const createFloorplanSVGString = (layoutObj) => {
     if (!layoutObj || !layoutObj.rooms || !layoutObj.rooms.length) return "";
-
     const rooms = layoutObj.rooms;
-    // compute bounds
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     rooms.forEach((r) => {
       const x1 = Number(r.x);
@@ -243,41 +244,26 @@ export default function Editor() {
       maxX = Math.max(maxX, x1 + s);
       maxY = Math.max(maxY, y1 + s);
     });
-    if (!isFinite(minX)) {
-      minX = 0; minY = 0; maxX = 10; maxY = 10;
-    }
-
-    const padding = 20; // px
-    const pxPerUnit = 80; // pixels per meter / unit — adjust if you want bigger
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = 10; maxY = 10; }
+    const padding = 20; const pxPerUnit = 80;
     const width = Math.max(200, Math.ceil((maxX - minX) * pxPerUnit) + padding * 2);
     const height = Math.max(200, Math.ceil((maxY - minY) * pxPerUnit) + padding * 2);
-
-    // helper to convert world coords to svg pixel coords
     const worldToSvgX = (x) => Math.round((x - minX) * pxPerUnit) + padding;
     const worldToSvgY = (y) => Math.round((y - minY) * pxPerUnit) + padding;
-
-    // build rects
     let rects = "";
-    rooms.forEach((r, idx) => {
+    rooms.forEach((r) => {
       const s = Number(r.size) || 1;
       const sx = worldToSvgX(Number(r.x));
       const sy = worldToSvgY(Number(r.y));
       const sw = Math.max(1, Math.round(s * pxPerUnit));
       const sh = Math.max(1, Math.round(s * pxPerUnit));
-      // rectangle and label
       rects += `<rect x="${sx}" y="${sy}" width="${sw}" height="${sh}" fill="rgba(58, 141, 255, 0.12)" stroke="#2A8BFF" stroke-width="2" />`;
-      // room name (centered)
-      const textX = sx + sw / 2;
-      const textY = sy + sh / 2;
+      const textX = sx + sw / 2; const textY = sy + sh / 2;
       rects += `<text x="${textX}" y="${textY}" font-family="Arial" font-size="${Math.max(10, Math.round(pxPerUnit/6))}" fill="#0b1723" text-anchor="middle" dominant-baseline="middle">${escapeXml(r.name)}</text>`;
-      // size text bottom-left
       rects += `<text x="${sx + 6}" y="${sy + sh - 6}" font-family="Arial" font-size="10" fill="#243444" >${s} m</text>`;
     });
-
-    // scale legend
     const scaleText = `Scale: 1 unit = 1 m, ${pxPerUnit}px per m`;
     const title = layoutObj.meta?.description || "Floorplan";
-
     const svg = `<?xml version="1.0" encoding="utf-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height + 60}" viewBox="0 0 ${width} ${height + 60}">
   <rect width="100%" height="100%" fill="#ffffff"/>
@@ -289,18 +275,10 @@ export default function Editor() {
 </svg>`;
     return svg;
   };
-
-  // helper to escape XML content for svg
   const escapeXml = (unsafe) => {
     if (!unsafe && unsafe !== 0) return "";
-    return String(unsafe)
-      .replace(/&/g, "&amp;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&apos;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
+    return String(unsafe).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&apos;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   };
-
   const handleExportSVG = () => {
     if (!layout) return alert("Nothing to export");
     const svgString = createFloorplanSVGString(layout);
@@ -314,7 +292,193 @@ export default function Editor() {
     URL.revokeObjectURL(url);
   };
 
-  // ---------------- render UI ----------------
+  // ---------- Versions: fetch, preview, revert ----------
+  const fetchVersions = async () => {
+    if (!projectId) {
+      alert("Save project first to get versions.");
+      return;
+    }
+    setLoadingVersions(true);
+    try {
+      const res = await api.get(`/projects/${projectId}/versions`);
+      setVersionsList(res.data.versions || []);
+      setVersionsOpen(true);
+      // reset compare state
+      setCompareMode(false);
+      setCompareLeftId(null);
+      setCompareRightId(null);
+      setCompareLeftLayout(null);
+      setCompareRightLayout(null);
+      setCompareDiff(null);
+    } catch (err) {
+      console.error("Failed to fetch versions", err);
+      alert(err?.response?.data?.detail || "Failed to fetch versions");
+    } finally {
+      setLoadingVersions(false);
+    }
+  };
+
+  const previewVersion = async (vid) => {
+    if (!projectId || !vid) return;
+    try {
+      const res = await api.get(`/projects/${projectId}/versions/${vid}`);
+      const vdata = res.data;
+      const proj = vdata.project;
+      if (!proj) {
+        alert("Invalid version data");
+        return;
+      }
+      setPreviewingVersion(vid);
+      setLayout(proj.layout);
+      setSelected(null);
+    } catch (err) {
+      console.error("Preview failed", err);
+      alert(err?.response?.data?.detail || "Failed to preview version");
+    }
+  };
+
+  const cancelPreview = async () => {
+    if (!projectId) {
+      alert("No project to restore; reload.");
+      setPreviewingVersion(null);
+      return;
+    }
+    try {
+      const res = await api.get(`/projects/${projectId}`);
+      const proj = res.data;
+      setLayout(proj.layout);
+      setPreviewingVersion(null);
+    } catch (err) {
+      console.error("Failed to reload project after preview", err);
+      alert("Failed to reload project. You may need to refresh the page.");
+    }
+  };
+
+  const revertToVersion = async (vid) => {
+    if (!projectId || !vid) return;
+    const ok = confirm("Reverting will replace current project with this version. Continue?");
+    if (!ok) return;
+    try {
+      await api.post(`/projects/${projectId}/versions/${vid}/revert`);
+      alert("Reverted to version " + vid);
+      const proj = (await api.get(`/projects/${projectId}`)).data;
+      setLayout(proj.layout);
+      setPreviewingVersion(null);
+      // refresh versions
+      const list = (await api.get(`/projects/${projectId}/versions`)).data.versions;
+      setVersionsList(list || []);
+    } catch (err) {
+      console.error("Revert failed", err);
+      alert(err?.response?.data?.detail || "Revert failed");
+    }
+  };
+
+  // ---------- Compare helpers ----------
+  const runCompare = async (leftId, rightId) => {
+    if (!projectId) return alert("No project saved yet.");
+    if (!leftId || !rightId) return alert("Choose two versions to compare.");
+    if (leftId === rightId) return alert("Pick two different versions.");
+
+    setLoadingCompare(true);
+    try {
+      const [lres, rres] = await Promise.all([
+        api.get(`/projects/${projectId}/versions/${leftId}`),
+        api.get(`/projects/${projectId}/versions/${rightId}`),
+      ]);
+      const lproj = lres.data.project;
+      const rproj = rres.data.project;
+      setCompareLeftLayout(lproj.layout);
+      setCompareRightLayout(rproj.layout);
+      const diff = computeLayoutDiff(lproj.layout, rproj.layout);
+      setCompareDiff(diff);
+      setCompareMode(true);
+    } catch (err) {
+      console.error("Compare failed", err);
+      alert(err?.response?.data?.detail || "Compare failed");
+    } finally {
+      setLoadingCompare(false);
+    }
+  };
+
+  // compute simple diff between two layouts (A -> B)
+  function computeLayoutDiff(A = { rooms: [] }, B = { rooms: [] }) {
+    const mapA = new Map((A.rooms || []).map((r) => [r.name, r]));
+    const mapB = new Map((B.rooms || []).map((r) => [r.name, r]));
+    const added = [];
+    const removed = [];
+    const modified = [];
+
+    // added: in B but not in A
+    for (const [name, br] of mapB.entries()) {
+      if (!mapA.has(name)) {
+        added.push(br);
+      }
+    }
+    // removed: in A not in B
+    for (const [name, ar] of mapA.entries()) {
+      if (!mapB.has(name)) {
+        removed.push(ar);
+      }
+    }
+    // modified: in both but prop differences
+    for (const [name, ar] of mapA.entries()) {
+      if (!mapB.has(name)) continue;
+      const br = mapB.get(name);
+      const changes = {};
+      const keys = ["x", "y", "size", "rotationY", "scale"];
+      keys.forEach((k) => {
+        const av = typeof ar[k] === "undefined" ? null : ar[k];
+        const bv = typeof br[k] === "undefined" ? null : br[k];
+        // numeric comparison with small epsilon for floats
+        if ((typeof av === "number" || typeof bv === "number")) {
+          const aNum = Number(av || 0);
+          const bNum = Number(bv || 0);
+          if (Math.abs(aNum - bNum) > 1e-4) changes[k] = [av, bv];
+        } else {
+          if (av !== bv) changes[k] = [av, bv];
+        }
+      });
+      if (Object.keys(changes).length > 0) {
+        modified.push({ name, changes, from: ar, to: br });
+      }
+    }
+
+    return { added, removed, modified };
+  }
+
+  // swap compare sides
+  const swapCompareSides = () => {
+    setCompareLeftId((prev) => {
+      const oldLeft = prev;
+      setCompareRightId((r) => oldLeft);
+      return compareRightId;
+    });
+    // swap layouts/diff too
+    setCompareLeftLayout(compareRightLayout);
+    setCompareRightLayout(compareLeftLayout);
+    if (compareDiff) {
+      // reversing diffs is simple: compute again with swapped inputs
+      setCompareDiff((prev) => {
+        if (!prev) return null;
+        const rev = computeLayoutDiff(compareRightLayout, compareLeftLayout);
+        return rev;
+      });
+    }
+  };
+
+  // helper to download the diff as JSON (for your report)
+  const downloadDiffJSON = () => {
+    if (!compareDiff) return alert("No diff computed");
+    const blob = new Blob([JSON.stringify(compareDiff, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `diff_${projectId}_${compareLeftId}_vs_${compareRightId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ---------- render ----------
   return (
     <div className="p-6 grid grid-cols-3 gap-6">
       <div className="col-span-1 space-y-4">
@@ -342,6 +506,7 @@ export default function Editor() {
         <div className="mt-4 flex gap-2">
           <button onClick={handleSaveProject} className="px-3 py-1 bg-blue-600 text-white rounded">Save Project (with thumbnail)</button>
           <button onClick={handleExportJSON} className="px-3 py-1 bg-gray-600 text-white rounded">Export JSON</button>
+          <button onClick={handleExportSVG} className="px-3 py-1 bg-green-600 text-white rounded">Export SVG</button>
         </div>
 
         <div className="mt-3 flex gap-2">
@@ -350,7 +515,9 @@ export default function Editor() {
         </div>
 
         <div className="mt-3">
-          <button onClick={handleExportSVG} className="px-3 py-1 bg-green-600 text-white rounded">Export 2D Floorplan (SVG)</button>
+          <button onClick={() => { if (!projectId) return alert("Save project first to access versions."); fetchVersions(); }} className="px-3 py-1 bg-indigo-600 text-white rounded" disabled={!projectId}>
+            Versions
+          </button>
         </div>
 
         {thumbnailUrl && (
@@ -384,11 +551,143 @@ export default function Editor() {
           <RoomEditor room={(layout?.rooms || []).find((r) => r.name === selected)} onChange={handleRoomChange} onDelete={handleDeleteRoom} />
         </div>
       </div>
+
+      {/* Versions modal / panel */}
+      {versionsOpen && (
+        <div style={{
+          position: "fixed", left: 20, right: 20, top: 40, bottom: 40,
+          background: "rgba(255,255,255,0.98)", border: "1px solid #ccc", borderRadius: 8, padding: 20, overflow: "auto", zIndex: 9999
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <h3>Versions for project {projectId}</h3>
+            <div>
+              <button onClick={() => { setVersionsOpen(false); setPreviewingVersion(null); setCompareMode(false); }} style={{ marginRight: 8 }} className="px-2 py-1 bg-gray-200 rounded">Close</button>
+              <button onClick={cancelPreview} className="px-2 py-1 bg-gray-200 rounded">Reload Current</button>
+            </div>
+          </div>
+
+          {loadingVersions ? <div>Loading versions...</div> : (
+            <div style={{ display: "grid", gap: 12 }}>
+              {/* Versions list */}
+              <div>
+                {versionsList.length === 0 ? <div>No versions found.</div> : (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {versionsList.map((v) => (
+                      <div key={v.version} style={{ border: "1px solid #ddd", padding: 8, borderRadius: 6, display: "flex", gap: 12, alignItems: "center" }}>
+                        <div style={{ width: 120, height: 80, background: "#f5f5f5", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          {v.thumbnail ? (
+                            <img src={`/projects/${projectId}/versions/${v.version}/thumbnail`} alt="thumb" style={{ maxWidth: "100%", maxHeight: "100%" }} onError={(e)=>{e.target.onerror=null; e.target.src="/favicon.ico"}} />
+                          ) : <div style={{ fontSize: 12, color: "#666" }}>No thumb</div>}
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontWeight: 600 }}>{v.name || "Version"}</div>
+                          <div style={{ fontSize: 12, color: "#666" }}>Version id: {v.version}</div>
+                          <div style={{ fontSize: 12, color: "#666" }}>Created: {v.created}</div>
+                        </div>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button onClick={() => previewVersion(v.version)} className="px-2 py-1 bg-blue-600 text-white rounded">Preview</button>
+                          <button onClick={() => revertToVersion(v.version)} className="px-2 py-1 bg-red-600 text-white rounded">Revert</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Compare controls */}
+              <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
+                <h4>Compare Versions</h4>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                  <select value={compareLeftId || ""} onChange={(e) => setCompareLeftId(e.target.value)} className="border p-1 rounded">
+                    <option value="">Select left version</option>
+                    {versionsList.map((v) => <option key={v.version} value={v.version}>{v.version} • {v.created}</option>)}
+                  </select>
+                  <button onClick={() => { if (!compareLeftId || !compareRightId) return; swapCompareSides(); }} className="px-2 py-1 bg-gray-200 rounded">Swap</button>
+                  <select value={compareRightId || ""} onChange={(e) => setCompareRightId(e.target.value)} className="border p-1 rounded">
+                    <option value="">Select right version</option>
+                    {versionsList.map((v) => <option key={v.version} value={v.version}>{v.version} • {v.created}</option>)}
+                  </select>
+                  <button onClick={() => runCompare(compareLeftId, compareRightId)} className="px-3 py-1 bg-indigo-600 text-white rounded" disabled={loadingCompare}>Compare</button>
+                  <button onClick={() => { setCompareMode(false); setCompareLeftLayout(null); setCompareRightLayout(null); setCompareDiff(null); }} className="px-3 py-1 bg-gray-200 rounded">Clear</button>
+                </div>
+
+                {loadingCompare && <div>Computing diff...</div>}
+
+                {/* Compare view */}
+                {compareMode && compareDiff && (
+                  <div style={{ display: "grid", gap: 12 }}>
+                    <div style={{ display: "flex", gap: 12 }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: 600, marginBottom: 6 }}>Left: {compareLeftId}</div>
+                        <div style={{ border: "1px solid #ddd", padding: 8, borderRadius: 6 }}>
+                          <ThreeDViewer layout={compareLeftLayout || { rooms: [] }} selectedRoomName={null} />
+                        </div>
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: 600, marginBottom: 6 }}>Right: {compareRightId}</div>
+                        <div style={{ border: "1px solid #ddd", padding: 8, borderRadius: 6 }}>
+                          <ThreeDViewer layout={compareRightLayout || { rooms: [] }} selectedRoomName={null} />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* diff summary */}
+                    <div style={{ borderTop: "1px dashed #ddd", paddingTop: 8 }}>
+                      <h5>Diff summary</h5>
+                      <div style={{ display: "flex", gap: 12 }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontWeight: 600 }}>Added in Right</div>
+                          {compareDiff.added.length === 0 ? <div style={{ color: "#666" }}>none</div> : compareDiff.added.map((r) => (
+                            <div key={r.name} style={{ padding: 6, border: "1px solid #e6f4ea", background: "#f3fff6", marginTop: 6, borderRadius: 4 }}>
+                              <div style={{ fontWeight: 600 }}>{r.name}</div>
+                              <div style={{ fontSize: 12 }}>size: {r.size} • x: {r.x} • y: {r.y}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontWeight: 600 }}>Removed from Right</div>
+                          {compareDiff.removed.length === 0 ? <div style={{ color: "#666" }}>none</div> : compareDiff.removed.map((r) => (
+                            <div key={r.name} style={{ padding: 6, border: "1px solid #fff0f0", background: "#fff7f7", marginTop: 6, borderRadius: 4 }}>
+                              <div style={{ fontWeight: 600 }}>{r.name}</div>
+                              <div style={{ fontSize: 12 }}>size: {r.size} • x: {r.x} • y: {r.y}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontWeight: 600 }}>Modified</div>
+                          {compareDiff.modified.length === 0 ? <div style={{ color: "#666" }}>none</div> : compareDiff.modified.map((m) => (
+                            <div key={m.name} style={{ padding: 6, border: "1px solid #eee", background: "#fff", marginTop: 6, borderRadius: 4 }}>
+                              <div style={{ fontWeight: 600 }}>{m.name}</div>
+                              <div style={{ fontSize: 12 }}>
+                                {Object.entries(m.changes).map(([k, [a, b]]) => (
+                                  <div key={k}><strong>{k}:</strong> {String(a)} → {String(b)}</div>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+                        <button onClick={() => downloadDiffJSON()} className="px-3 py-1 bg-gray-200 rounded">Download diff JSON</button>
+                        <button onClick={() => { /* preview left in main editor */ if (compareLeftId) previewVersion(compareLeftId); }} className="px-3 py-1 bg-blue-600 text-white rounded">Open Left in Editor</button>
+                        <button onClick={() => { /* preview right in main editor */ if (compareRightId) previewVersion(compareRightId); }} className="px-3 py-1 bg-blue-600 text-white rounded">Open Right in Editor</button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
-/* small AddRoomForm nested component */
+/* AddRoomForm nested component */
 function AddRoomForm({ onAdd }) {
   const [name, setName] = React.useState("");
   const [size, setSize] = React.useState(3);
