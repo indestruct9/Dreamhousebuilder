@@ -1,78 +1,93 @@
 // src/components/ThreeDViewer.jsx
-import React, { useRef, useImperativeHandle, forwardRef, useState } from "react";
-import { Canvas, useThree, useFrame } from "@react-three/fiber";
-import { OrbitControls, Html, Grid } from "@react-three/drei";
+import React, { useRef, useEffect, useImperativeHandle, forwardRef } from "react";
+import { Canvas, useThree } from "@react-three/fiber";
+import { OrbitControls, Html, Grid, TransformControls } from "@react-three/drei";
 import * as THREE from "three";
 
-const DragPlane = () => {
-  return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]} visible={false}>
-      <planeGeometry args={[500, 500]} />
-      <meshBasicMaterial transparent opacity={0} />
-    </mesh>
-  );
-};
+/**
+ * ThreeDViewer
+ * Props:
+ *  - layout: { rooms: [ {name, size, x, y, rotation? , scale? } ] }
+ *  - selectedRoomName
+ *  - onSelectRoom(name)
+ *  - onTransformEnd(name, { x, y, rotationY, scale })
+ *  - mode: "translate" | "rotate" | "scale"
+ *  - snap: number (optional) - grid snap size in same units as x,y
+ *
+ * Exposes:
+ *  - capture(): returns dataURL PNG of canvas via ref
+ */
 
-const CanvasContent = forwardRef(({ layout, selectedRoomName, onSelectRoom, onMoveRoom }, ref) => {
-  const { gl, camera, scene } = useThree();
-  const raycaster = new THREE.Raycaster();
-  const mouse = new THREE.Vector2();
+const SceneInner = forwardRef(({ layout, selectedRoomName, onSelectRoom, onTransformEnd, mode = "translate", snap = 0 }, ref) => {
+  const { gl, scene, camera } = useThree();
+  const transformRef = useRef();
+  const groupRefs = useRef({}); // name -> group object3D
 
-  const [dragging, setDragging] = useState(null); // room name
-  const dragOffset = useRef([0, 0]); // offset inside room
+  // expose capture() up to outer ref
+  useImperativeHandle(ref, () => ({
+    capture: () => {
+      try {
+        // ensure a final render
+        gl.render(scene, camera);
+      } catch (e) {}
+      return gl.domElement.toDataURL("image/png");
+    },
+  }), [gl, scene, camera]);
 
-  // Expose screenshot capture
-  useImperativeHandle(
-    ref,
-    () => ({
-      capture: () => {
-        try {
-          gl.render(scene, camera);
-        } catch (e) {}
-        return gl.domElement.toDataURL("image/png");
-      },
-    }),
-    [gl, scene, camera]
-  );
+  // When selection changes or transformRef created, attach events to control
+  useEffect(() => {
+    const controls = transformRef.current;
+    if (!controls) return;
 
-  const handlePointerDown = (e, room) => {
-    e.stopPropagation();
-    onSelectRoom && onSelectRoom(room.name);
-    setDragging(room.name);
+    // objectChange fires continuously while transforming
+    const onObjectChange = () => {
+      // live updates not pushed here; we wait until interaction ends
+    };
 
-    // calculate offset inside box
-    const intersect = e.intersections[0];
-    if (intersect) {
-      const point = intersect.point;
-      dragOffset.current = [point.x - room.x, point.z - room.y];
-    }
-  };
+    // mouseUp indicates the user finished the transform
+    const onMouseUp = () => {
+      if (!selectedRoomName) return;
+      const grp = groupRefs.current[selectedRoomName];
+      if (!grp) return;
+      // grp.position is center position; convert to top-left x,y in layout coordinate system:
+      const roomDef = (layout.rooms || []).find((r) => r.name === selectedRoomName);
+      const size = Number(roomDef?.size) || 3;
+      // center -> top-left:
+      const newX = Number((grp.position.x - size / 2).toFixed(3));
+      const newY = Number((grp.position.z - size / 2).toFixed(3));
+      const rotationY = Number((grp.rotation.y || 0).toFixed(5));
+      const scale = Number((grp.scale.x || 1).toFixed(5));
+      // optional snapping
+      const snapTo = (v) => (snap ? Math.round(v / snap) * snap : v);
+      onTransformEnd && onTransformEnd(selectedRoomName, {
+        x: snapTo(newX),
+        y: snapTo(newY),
+        rotationY,
+        scale,
+      });
+    };
 
-  const handlePointerUp = () => {
-    setDragging(null);
-  };
+    controls.addEventListener("objectChange", onObjectChange);
+    controls.addEventListener("mouseUp", onMouseUp);
 
-  const handlePointerMove = (e) => {
-    if (!dragging) return;
-    e.stopPropagation();
-    // raycast to drag plane
-    mouse.x = (e.clientX / gl.domElement.clientWidth) * 2 - 1;
-    mouse.y = -(e.clientY / gl.domElement.clientHeight) * 2 + 1;
-    raycaster.setFromCamera(mouse, camera);
+    return () => {
+      controls.removeEventListener("objectChange", onObjectChange);
+      controls.removeEventListener("mouseUp", onMouseUp);
+    };
+  }, [transformRef, selectedRoomName, layout, onTransformEnd, snap]);
 
-    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-    const intersectPoint = new THREE.Vector3();
-    raycaster.ray.intersectPlane(plane, intersectPoint);
-
-    if (intersectPoint) {
-      const [ox, oy] = dragOffset.current;
-      const newX = intersectPoint.x - ox;
-      const newY = intersectPoint.z - oy;
-      onMoveRoom && onMoveRoom(dragging, newX, newY);
-    }
-  };
-
-  useFrame(() => {}); // ensure rerender
+  // Keep the group positions in sync with layout when layout changes externally
+  useEffect(() => {
+    (layout.rooms || []).forEach((r) => {
+      const g = groupRefs.current[r.name];
+      if (g) {
+        const size = Number(r.size) || 3;
+        g.position.set(Number(r.x) + size / 2, 0, Number(r.y) + size / 2);
+        if (typeof r.rotationY !== "undefined") g.rotation.set(0, r.rotationY, 0);
+        if (typeof r.scale !== "undefined") g.scale.set(r.scale, r.scale, r.scale);
+      }
+    });
+  }, [layout]);
 
   return (
     <>
@@ -81,43 +96,57 @@ const CanvasContent = forwardRef(({ layout, selectedRoomName, onSelectRoom, onMo
       <directionalLight position={[10, 15, 10]} intensity={0.8} castShadow />
       <Grid args={[100, 100]} cellColor="#2b2b2b" sectionColor="#2b2b2b" position={[0, 0.001, 0]} />
 
-      <DragPlane />
+      {/* Ground plane to receive pointer events if needed */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, 0]}>
+        <planeGeometry args={[1000, 1000]} />
+        <meshStandardMaterial color="#111" transparent opacity={0} />
+      </mesh>
 
-      {layout.rooms?.map((room) => {
+      {(layout.rooms || []).map((room) => {
         const size = Number(room.size) || 3;
-        const centerX = room.x + size / 2;
-        const centerZ = room.y + size / 2;
-        return (
-          <group key={room.name} position={[centerX, 0, centerZ]}>
-            <mesh
-              position={[0, 0.5, 0]}
-              castShadow
-              receiveShadow
-              onPointerDown={(e) => handlePointerDown(e, room)}
-              onPointerUp={handlePointerUp}
-              onPointerMove={handlePointerMove}
+        const centerX = Number(room.x) + size / 2;
+        const centerZ = Number(room.y) + size / 2;
+        const isSelected = selectedRoomName === room.name;
+
+        // If selected, wrap the group in TransformControls so user can transform it
+        const GroupContents = (
+          <group
+            key={room.name + "-group"}
+            ref={(el) => (groupRefs.current[room.name] = el)}
+            position={[centerX, 0, centerZ]}
+          >
+            <mesh position={[0, 0.5, 0]} castShadow receiveShadow
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                onSelectRoom && onSelectRoom(room.name);
+              }}
             >
               <boxGeometry args={[size, 1, size]} />
-              <meshStandardMaterial
-                color={selectedRoomName === room.name ? "#ff8c42" : "#2aa3ff"}
-                roughness={0.5}
-                metalness={0.1}
-              />
+              <meshStandardMaterial color={isSelected ? "#ff8c42" : "#2aa3ff"} roughness={0.5} metalness={0.1} />
             </mesh>
             <Html position={[0, 1.05, 0]} center>
-              <div
-                style={{
-                  color: "white",
-                  background: "rgba(0,0,0,0.6)",
-                  padding: "3px 6px",
-                  borderRadius: 6,
-                  fontSize: 12,
-                }}
-              >
+              <div style={{ color: "white", background: "rgba(0,0,0,0.6)", padding: "3px 6px", borderRadius: 6, fontSize: 12 }}>
                 {room.name}
               </div>
             </Html>
           </group>
+        );
+
+        return isSelected ? (
+          <TransformControls
+            key={room.name}
+            ref={transformRef}
+            mode={mode}
+            showX
+            showY
+            showZ
+            // disable pointer events propagation so OrbitControls doesn't fight
+            onMouseDown={(e) => { e.stopPropagation(); }}
+          >
+            {GroupContents}
+          </TransformControls>
+        ) : (
+          GroupContents
         );
       })}
 
@@ -126,9 +155,10 @@ const CanvasContent = forwardRef(({ layout, selectedRoomName, onSelectRoom, onMo
   );
 });
 
-const ThreeDViewer = forwardRef(({ layout = { rooms: [] }, selectedRoomName, onSelectRoom, onMoveRoom }, ref) => {
+const ThreeDViewer = forwardRef(({ layout = { rooms: [] }, selectedRoomName, onSelectRoom, onTransformEnd, mode = "translate", snap = 0 }, ref) => {
   const innerRef = useRef();
 
+  // forward capture
   useImperativeHandle(ref, () => ({
     capture: () => {
       if (!innerRef.current) return null;
@@ -137,23 +167,9 @@ const ThreeDViewer = forwardRef(({ layout = { rooms: [] }, selectedRoomName, onS
   }));
 
   return (
-    <div
-      style={{
-        width: "100%",
-        height: "520px",
-        borderRadius: 8,
-        overflow: "hidden",
-        background: "#111",
-      }}
-    >
+    <div style={{ width: "100%", height: "520px", borderRadius: 8, overflow: "hidden", background: "#111" }}>
       <Canvas shadows camera={{ position: [10, 12, 10], fov: 50 }}>
-        <CanvasContent
-          ref={innerRef}
-          layout={layout}
-          selectedRoomName={selectedRoomName}
-          onSelectRoom={onSelectRoom}
-          onMoveRoom={onMoveRoom}
-        />
+        <SceneInner ref={innerRef} layout={layout} selectedRoomName={selectedRoomName} onSelectRoom={onSelectRoom} onTransformEnd={onTransformEnd} mode={mode} snap={snap} />
       </Canvas>
     </div>
   );
